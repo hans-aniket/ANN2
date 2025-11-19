@@ -114,12 +114,41 @@ kpi1.metric("Current Demand", f"{df['DEMAND'].iloc[-1]:,.0f} m³")
 kpi2.metric("Avg Temp (Fusion)", f"{df['TEMP_AVG'].iloc[-1]:.1f} °C")
 kpi3.metric("Aquifer Depth", f"{df['DEPTH'].iloc[-1]:.2f} m")
 
-# Chart
-dates = pd.date_range(start=df.index[-1], periods=days + 1)[1:]
+# Chart Visualization Logic
+# 1. Create future dates starting from TODAY
+today = pd.Timestamp.now().normalize()
+future_dates = pd.date_range(start=today, periods=days + 1)[1:]
+
+# 2. Shift historical data to end "yesterday" for visual continuity
+# Calculate the time difference between the last actual data point and today
+shift_delta = today - df.index[-1]
+shifted_history_index = df.index[-180:] + shift_delta
+
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=df.index[-180:], y=df['DEMAND'].iloc[-180:], name='Historical', line=dict(color='blue')))
-fig.add_trace(go.Scatter(x=dates, y=forecast_final, name='AI Forecast', line=dict(color='red', dash='dash')))
-fig.update_layout(title="Demand Projections", xaxis_title="Date", yaxis_title="Volume (m³)", height=450)
+
+# Plot Historical Data (Shifted)
+fig.add_trace(go.Scatter(
+    x=shifted_history_index, 
+    y=df['DEMAND'].iloc[-180:], 
+    name='Historical Context (Simulated)', 
+    line=dict(color='#1f77b4')
+))
+
+# Plot Forecast Data (Red) - Now aligned with Nov 2025
+fig.add_trace(go.Scatter(
+    x=future_dates, 
+    y=forecast_final, 
+    name='AI Forecast (Nov 2025)', 
+    line=dict(color='#ff7f0e', width=3, dash='dash')
+))
+
+fig.update_layout(
+    title="Demand Projections (Simulated for Current Period)", 
+    xaxis_title="Date", 
+    yaxis_title="Volume (m³)", 
+    height=450,
+    hovermode="x unified"
+)
 st.plotly_chart(fig, use_container_width=True)
 
 # Storage Logic
@@ -130,7 +159,7 @@ pct = (end_level / capacity) * 100
 st.subheader("⚠️ Storage Impact Analysis")
 c1, c2 = st.columns([1, 2])
 
-c1.metric("Forecasted Drawdown", f"{total_draw:,.0f} m³", delta=f"-{total_draw/current_lvl:.1%}")
+c1.metric("Forecasted Drawdown", f"{total_draw:,.0f} m³", delta=f"-{total_draw/current_lvl:.1%} of current")
 
 if end_level < 0:
     c2.error(f"🚨 CRITICAL FAILURE: Water runout in {days} days. Deficit: {abs(end_level):,.0f} m³")
