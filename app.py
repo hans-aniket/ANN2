@@ -5,149 +5,136 @@ import joblib
 import plotly.graph_objs as go
 from tensorflow.keras.models import load_model
 
-# --- Configuration ---
-st.set_page_config(page_title="Water Demand AI", layout="wide")
+# --- Page Config ---
+st.set_page_config(page_title="Water AI", layout="wide")
 
-# --- 1. Load Data & Models ---
+# --- 1. Load Artifacts ---
 @st.cache_resource
-def load_artifacts():
+def load_brain():
+    # Load the trained model and the scaler used for normalization
     model = load_model('water_demand_lstm_model.h5')
     scaler = joblib.load('scaler.pkl')
     return model, scaler
 
+# --- 2. Load & Prep Data ---
 @st.cache_data
-def load_data():
+def get_data():
     df = pd.read_csv('Aquifer_Petrignano.csv')
+    
+    # REPLICATE SENSOR FUSION FROM TRAINING
+    df['TEMP_AVG'] = df[['Temperature_Bastia_Umbra', 'Temperature_Petrignano']].mean(axis=1)
+    
     df = df.rename(columns={
         'Date': 'DATE',
         'Rainfall_Bastia_Umbra': 'RAIN',
         'Depth_to_Groundwater_P25': 'DEPTH',
-        'Temperature_Bastia_Umbra': 'TEMP',
         'Volume_C10_Petrignano': 'DEMAND'
     })
+    
     df['DATE'] = pd.to_datetime(df['DATE'], format='%d/%m/%Y')
     df = df.sort_values('DATE')
-    # Handle negative volume (extraction) as positive demand
     df['DEMAND'] = df['DEMAND'].abs()
-    df = df.dropna(subset=['DEMAND'])
-    df = df.interpolate(method='linear', limit_direction='forward')
+    
+    df = df.interpolate(method='linear', limit_direction='both')
     df = df.fillna(0)
     df = df.set_index('DATE')
-    return df[['DEMAND', 'RAIN', 'TEMP', 'DEPTH']]
+    
+    # Return exactly the columns model expects: [Target, Rain, Temp, Depth]
+    return df[['DEMAND', 'RAIN', 'TEMP_AVG', 'DEPTH']]
 
 try:
-    model, scaler = load_artifacts()
-    df = load_data()
+    model, scaler = load_brain()
+    df = get_data()
 except Exception as e:
-    st.error(f"Error loading files: {e}")
+    st.error(f"🚨 Error: {e}. Please run the training notebook first!")
     st.stop()
 
-# --- 2. Sidebar: Controls ---
-st.sidebar.header("⚙️ Simulation Controls")
+# --- 3. Sidebar Controls ---
+st.sidebar.title("⚙️ Control Panel")
 
-st.sidebar.subheader("Forecast Parameters")
-days_to_predict = st.sidebar.slider("Days to Forecast", 7, 90, 30)
+days = st.sidebar.slider("Forecast Days", 7, 90, 30)
 
-st.sidebar.subheader("Weather Scenarios")
-future_rain = st.sidebar.slider("Simulated Rainfall (mm)", 0.0, 20.0, float(df['RAIN'].mean()))
-future_temp = st.sidebar.slider("Simulated Temp (°C)", -5.0, 40.0, float(df['TEMP'].mean()))
+st.sidebar.subheader("Scenario Simulation")
+avg_rain = df['RAIN'].mean()
+avg_temp = df['TEMP_AVG'].mean()
 
-st.sidebar.subheader("Infrastructure Specs")
-# Set default capacity to 5 Million m3 (approx 6 months of supply)
-reservoir_capacity = st.sidebar.number_input("Max Reservoir Capacity (m³)", value=5000000, step=100000)
-# Default current level to 80% of capacity
-initial_level = st.sidebar.number_input("Current Storage Level (m³)", value=int(reservoir_capacity * 0.8), step=100000)
+sim_rain = st.sidebar.slider("Rainfall (mm)", 0.0, 20.0, float(avg_rain))
+sim_temp = st.sidebar.slider("Temperature (°C)", -5.0, 40.0, float(avg_temp))
 
-# --- 3. Main Dashboard ---
-st.title("💧 AI-Powered Water Demand Forecasting")
+st.sidebar.subheader("Reservoir")
+# Realistic capacity for 30k demand/day = ~5-6M m3
+capacity = st.sidebar.number_input("Reservoir Capacity (m³)", value=5000000, step=500000)
+current_lvl = st.sidebar.number_input("Current Level (m³)", value=3500000, step=100000)
 
-# Metrics
-current_demand = df['DEMAND'].iloc[-1]
-col1, col2, col3 = st.columns(3)
-col1.metric("Last Recorded Demand", f"{current_demand:,.0f} m³")
-col2.metric("Aquifer Depth", f"{df['DEPTH'].iloc[-1]:.2f} m")
-col3.metric("Simulated Rainfall", f"{future_rain:.1f} mm")
-
-# --- 4. Forecasting Logic ---
-def make_forecast(model, scaler, last_sequence, days, rain, temp):
-    forecast = []
+# --- 4. Forecast Engine ---
+def forecast_future(model, scaler, last_sequence, n_days, rain, temp):
+    predictions = []
     curr_seq = last_sequence.copy()
     last_depth = df['DEPTH'].iloc[-1]
     
-    # Get min/max from original df for scaling manual inputs
-    rain_min, rain_max = df['RAIN'].min(), df['RAIN'].max()
-    temp_min, temp_max = df['TEMP'].min(), df['TEMP'].max()
-    depth_min, depth_max = df['DEPTH'].min(), df['DEPTH'].max()
-
-    for _ in range(days):
-        input_data = curr_seq.reshape(1, 60, 4)
-        pred_scaled = model.predict(input_data, verbose=0)[0][0]
+    # Get scale ranges to normalize user input manually
+    # scaler.data_min_ stores [min_demand, min_rain, min_temp, min_depth]
+    min_vals = scaler.data_min_
+    max_vals = scaler.data_max_
+    
+    for _ in range(n_days):
+        # 1. Predict Scaled Demand
+        input_seq = curr_seq.reshape(1, 60, 4)
+        pred_demand_scaled = model.predict(input_seq, verbose=0)[0][0]
         
-        # Scale user inputs
-        s_rain = (rain - rain_min) / (rain_max - rain_min)
-        s_temp = (temp - temp_min) / (temp_max - temp_min)
-        s_depth = (last_depth - depth_min) / (depth_max - depth_min)
+        # 2. Scale User Inputs (Rain/Temp) 
+        # Formula: (Value - Min) / (Max - Min)
+        s_rain = (rain - min_vals[1]) / (max_vals[1] - min_vals[1])
+        s_temp = (temp - min_vals[2]) / (max_vals[2] - min_vals[2])
+        s_depth = (last_depth - min_vals[3]) / (max_vals[3] - min_vals[3]) # Constant depth assumption
         
-        next_step = np.array([pred_scaled, s_rain, s_temp, s_depth])
-        forecast.append(next_step)
-        curr_seq = np.append(curr_seq[1:], [next_step], axis=0)
+        # 3. Create New Row [Demand, Rain, Temp, Depth]
+        new_row = np.array([pred_demand_scaled, s_rain, s_temp, s_depth])
         
-    return np.array(forecast)
+        # 4. Update Sequence
+        predictions.append(new_row)
+        curr_seq = np.append(curr_seq[1:], [new_row], axis=0)
+        
+    return np.array(predictions)
 
-# Prepare Data
-scaled_dataset = scaler.transform(df.values)
-last_60_days = scaled_dataset[-60:]
+# Run Forecast
+last_60_days_scaled = scaler.transform(df.values)[-60:]
+with st.spinner("🤖 AI is thinking..."):
+    forecast_scaled = forecast_future(model, scaler, last_60_days_scaled, days, sim_rain, sim_temp)
 
-with st.spinner('Running AI Model...'):
-    forecast_scaled = make_forecast(model, scaler, last_60_days, days_to_predict, future_rain, future_temp)
+# Inverse Transform to get real values
+forecast_final = scaler.inverse_transform(forecast_scaled)[:, 0] # Column 0 is Demand
 
-# Invert scaling
-forecast_values = scaler.inverse_transform(forecast_scaled)
-predicted_demand = forecast_values[:, 0]
+# --- 5. Dashboard UI ---
+st.title("💧 Water Demand Forecasting System")
 
-# --- 5. Visualization ---
+# KPI Row
+kpi1, kpi2, kpi3 = st.columns(3)
+kpi1.metric("Current Demand", f"{df['DEMAND'].iloc[-1]:,.0f} m³")
+kpi2.metric("Avg Temp (Fusion)", f"{df['TEMP_AVG'].iloc[-1]:.1f} °C")
+kpi3.metric("Aquifer Depth", f"{df['DEPTH'].iloc[-1]:.2f} m")
+
+# Chart
+dates = pd.date_range(start=df.index[-1], periods=days + 1)[1:]
 fig = go.Figure()
-last_date = df.index[-1]
-future_dates = pd.date_range(start=last_date, periods=days_to_predict + 1)[1:]
-
-fig.add_trace(go.Scatter(
-    x=df.index[-90:], y=df['DEMAND'].iloc[-90:],
-    mode='lines', name='Historical', line=dict(color='blue')
-))
-fig.add_trace(go.Scatter(
-    x=future_dates, y=predicted_demand,
-    mode='lines', name='Forecast', line=dict(color='red', dash='dash')
-))
-fig.update_layout(title='Demand Forecast', xaxis_title='Date', yaxis_title='Volume (m³)', height=400)
+fig.add_trace(go.Scatter(x=df.index[-180:], y=df['DEMAND'].iloc[-180:], name='Historical', line=dict(color='blue')))
+fig.add_trace(go.Scatter(x=dates, y=forecast_final, name='AI Forecast', line=dict(color='red', dash='dash')))
+fig.update_layout(title="Demand Projections", xaxis_title="Date", yaxis_title="Volume (m³)", height=450)
 st.plotly_chart(fig, use_container_width=True)
 
-# --- 6. Storage Analysis ---
-st.subheader("⚠️ Storage Risk Analysis")
+# Storage Logic
+total_draw = np.sum(forecast_final)
+end_level = current_lvl - total_draw
+pct = (end_level / capacity) * 100
 
-total_demand = np.sum(predicted_demand)
-# Calculate Net Storage (Assuming 0 inflow for worst-case scenario)
-final_storage = initial_level - total_demand
-percent_full = (final_storage / reservoir_capacity) * 100
+st.subheader("⚠️ Storage Impact Analysis")
+c1, c2 = st.columns([1, 2])
 
-col_a, col_b = st.columns([1, 2])
+c1.metric("Forecasted Drawdown", f"{total_draw:,.0f} m³", delta=f"-{total_draw/current_lvl:.1%}")
 
-with col_a:
-    st.metric("Total Forecasted Demand", f"{total_demand:,.0f} m³")
-    if final_storage < 0:
-        st.metric("Storage Deficit", f"{abs(final_storage):,.0f} m³", delta_color="inverse")
-    else:
-        st.metric("Ending Storage", f"{final_storage:,.0f} m³")
-
-with col_b:
-    st.write(f"**Reservoir Status ({days_to_predict} Days)**")
-    if final_storage < 0:
-        st.error(f"🚨 CRITICAL: Water supply depleted! Deficit of {abs(final_storage):,.0f} m³ predicted.")
-        st.progress(0)
-    else:
-        st.progress(min(1.0, max(0.0, final_storage / reservoir_capacity)))
-        st.write(f"Reservoir will be **{percent_full:.1f}%** full.")
-        
-        if percent_full < 20:
-            st.warning("Warning: Storage levels approaching critical low (<20%).")
-        else:
-            st.success("Storage levels adequate for forecasted demand.")
+if end_level < 0:
+    c2.error(f"🚨 CRITICAL FAILURE: Water runout in {days} days. Deficit: {abs(end_level):,.0f} m³")
+    c2.progress(0)
+else:
+    c2.info(f"Projected Storage: {end_level:,.0f} / {capacity:,.0f} m³ ({pct:.1f}%)")
+    c2.progress(min(1.0, pct/100))
