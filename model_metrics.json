@@ -1,8 +1,0 @@
-{
-    "test_rmse": 35.5,
-    "test_mae": 21.43,
-    "look_back": 60,
-    "lstm_units": 64,
-    "n_features": 2,
-    "train_samples": 4884
-}
