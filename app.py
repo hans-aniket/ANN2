@@ -19,6 +19,7 @@ def load_brain():
 @st.cache_data
 def get_data():
     df = pd.read_csv('Aquifer_Petrignano.csv')
+    # Sensor Fusion
     df['TEMP_AVG'] = df[['Temperature_Bastia_Umbra', 'Temperature_Petrignano']].mean(axis=1)
     
     df = df.rename(columns={
@@ -49,7 +50,6 @@ st.sidebar.title("⚙️ Simulation Controls")
 days = st.sidebar.slider("Forecast Horizon", 7, 90, 30)
 
 st.sidebar.subheader("Weather Scenario")
-# Defaults based on recent history
 recent_rain = float(df['RAIN'].tail(30).mean())
 recent_temp = float(df['TEMP_AVG'].tail(30).mean())
 
@@ -60,7 +60,7 @@ st.sidebar.subheader("Infrastructure")
 capacity = st.sidebar.number_input("Reservoir Capacity (m³)", value=5000000, step=500000)
 current_lvl = st.sidebar.number_input("Current Level (m³)", value=3500000, step=100000)
 
-# --- 4. Forecast Logic (Calculated BEFORE UI) ---
+# --- 4. Forecast Logic ---
 def forecast_future(model, scaler, last_sequence, n_days, rain, temp):
     predictions = []
     curr_seq = last_sequence.copy()
@@ -83,49 +83,27 @@ def forecast_future(model, scaler, last_sequence, n_days, rain, temp):
         
     return np.array(predictions)
 
-# Run Forecast Immediately
+# Run Forecast
 last_60_days_scaled = scaler.transform(df.values)[-60:]
 forecast_scaled = forecast_future(model, scaler, last_60_days_scaled, days, sim_rain, sim_temp)
-forecast_final = scaler.inverse_transform(forecast_scaled)[:, 0] # Extract Demand
+forecast_final = scaler.inverse_transform(forecast_scaled)[:, 0]
 
-# --- 5. Dashboard UI (Now using Dynamic Data) ---
+# --- 5. Dashboard UI ---
 st.title("💧 Water Demand Forecasting System")
 
-# Calculate Dynamic Metrics based on the Forecast we just ran
+# Metric 1: Average Predicted Demand (Comparison to History)
 avg_pred_demand = np.mean(forecast_final)
-total_pred_demand = np.sum(forecast_final)
-peak_pred_demand = np.max(forecast_final)
 historical_avg = df['DEMAND'].mean()
 
-# Dynamic KPI Row
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Forecasted Avg Demand", 
+col_main = st.columns(1)[0]
+col_main.metric(
+    "Forecasted Daily Avg", 
     f"{avg_pred_demand:,.0f} m³", 
     delta=f"{((avg_pred_demand - historical_avg)/historical_avg)*100:.1f}% vs Hist",
-    delta_color="inverse" # Red if demand goes UP
+    delta_color="inverse"
 )
 
-col2.metric(
-    "Peak Demand Day", 
-    f"{peak_pred_demand:,.0f} m³",
-    "Max stress point"
-)
-
-col3.metric(
-    "Total Water Required", 
-    f"{total_pred_demand:,.0f} m³",
-    f"Over next {days} days"
-)
-
-col4.metric(
-    "Scenario Inputs",
-    f"{sim_temp}°C / {sim_rain}mm",
-    "Simulation Settings"
-)
-
-# --- 6. Visualization ---
+# Chart Visualization
 today = pd.Timestamp.now().normalize()
 future_dates = pd.date_range(start=today, periods=days + 1)[1:]
 shift_delta = today - df.index[-1]
@@ -135,24 +113,35 @@ fig = go.Figure()
 fig.add_trace(go.Scatter(x=shifted_history_index, y=df['DEMAND'].iloc[-180:], name='Historical Context', line=dict(color='rgba(31, 119, 180, 0.5)')))
 fig.add_trace(go.Scatter(x=future_dates, y=forecast_final, name='Simulated Forecast', line=dict(color='#ff7f0e', width=3)))
 
-fig.update_layout(title="Demand Simulation", xaxis_title="Date", yaxis_title="Volume (m³)", height=450, hovermode="x unified")
+fig.update_layout(title="Demand Simulation", xaxis_title="Date", yaxis_title="Volume (m³)", height=400, hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
-# --- 7. Storage Logic ---
-end_level = current_lvl - total_pred_demand
-pct = (end_level / capacity) * 100
+# --- 6. Storage Impact (Restored Layout) ---
+st.subheader("⚠️ Storage Risk Analysis")
 
-st.subheader("Reservoir Status (End of Period)")
-c1, c2 = st.columns([1, 3])
+total_demand = np.sum(forecast_final)
+end_storage = current_lvl - total_demand
+percent_full = (end_storage / capacity) * 100
 
-if end_level < 0:
-    c1.metric("Final Status", "DEPLETED", delta="CRITICAL", delta_color="inverse")
-    c2.error(f"🚨 STORAGE DEPLETED: Deficit of {abs(end_level):,.0f} m³ predicted under these conditions.")
-    c2.progress(0)
-else:
-    c1.metric("Final Storage", f"{end_level:,.0f} m³", delta=f"{pct:.1f}% Full")
-    c2.progress(min(1.0, pct/100))
-    if pct < 20:
-        c2.warning("⚠️ Warning: Low storage levels predicted.")
+col_a, col_b = st.columns([1, 2])
+
+with col_a:
+    st.metric("Total Forecasted Demand", f"{total_demand:,.0f} m³")
+    if end_storage < 0:
+        st.metric("Storage Deficit", f"{abs(end_storage):,.0f} m³", delta_color="inverse")
     else:
-        c2.success("✅ Storage levels adequate.")
+        st.metric("Ending Storage", f"{end_storage:,.0f} m³")
+
+with col_b:
+    st.write(f"**Reservoir Status ({days} Days)**")
+    if end_storage < 0:
+        st.error(f"🚨 CRITICAL: Water supply depleted! Deficit of {abs(end_storage):,.0f} m³ predicted.")
+        st.progress(0)
+    else:
+        st.progress(min(1.0, max(0.0, end_storage / capacity)))
+        st.write(f"Reservoir will be **{percent_full:.1f}%** full.")
+        
+        if percent_full < 20:
+            st.warning("Warning: Storage levels approaching critical low (<20%).")
+        else:
+            st.success("Storage levels adequate for forecasted demand.")
